@@ -1,0 +1,170 @@
+---
+- name: Instalar e configurar containerd
+  hosts: all
+  tasks:
+    # overlay serve para que dois ou mais sistemas de arquivos
+    # possam ser visualizados como um só, unindo objetos de
+    # cada um numa única visualização
+    # br_netfilter facilita o uso de redes virtuais no cluster
+    - name: Carregamento de módulos de Kernel overlay e br_netfilter durante o boot
+      ansible.builtin.copy:
+        src: ./k8s.conf
+        dest: /etc/modules-load.d/k8s.conf
+        mode: 0644
+
+    - name: Ativação do módulo de kernel overlay
+      modprobe:
+        name: overlay
+        state: present
+
+    - name: Ativação do módulo de kernel br_netfilter
+      modprobe:
+        name: br_netfilter
+        state: present
+    
+    # faz forwarding de ipv4 e permite iptables visualizar tráego bridged
+    - name: Adição de configurações de rede necessárias para o cri no boot 
+      ansible.builtin.copy:
+        src: ./k8s.cri.conf
+        dest: /etc/sysctl.d/k8s.conf
+        mode: '644'
+
+    - name: Carrega as configurações com sysctl --system
+      command: "sysctl --system"
+
+    # usa servidores do docker para instalar containerd
+    - name: Instala gpg
+      apt:
+        name: gpg
+        update_cache: yes
+
+    - name: Adiciona chave do repositório docker
+      get_url:
+        url: https://download.docker.com/linux/debian/gpg
+        dest: /etc/apt/trusted.gpg.d/containerd.asc
+        mode: 0644
+        force: true
+
+    - name: Adiciona repositório para instalar containerd
+      apt_repository:
+        repo: deb [arch=amd64 signed-by=/etc/apt/trusted.gpg.d/containerd.asc] https://download.docker.com/linux/debian   bookworm stable
+        state: present
+
+    - name: Instala containerd
+      apt:
+        name: containerd
+        update_cache: yes
+
+    - name: Cria diretório de config do containerd
+      file:
+        path: /etc/containerd
+        state: directory
+        owner: root
+        group: root
+        mode: 0644
+
+    - name: Adiciona arquivo de config do containerd
+      shell: containerd config default > /etc/containerd/config.toml
+    
+    # configura o systemd cgroup driver, para utilizaro systemd como gerenciador dos recursos da máquina para o cluster
+    - name: Configura systemd cgroup driver
+      command: sed -i 's/SystemdCgroup = false/SystemdCgroup = true/g' /etc/containerd/config.toml
+
+    - name: Reinicia containerd para aplicar mudanças de config
+      ansible.builtin.service:
+        name: containerd
+        state: restarted
+
+
+# Instalação do kubeadm, kubelet e kubectl
+- name: Instalação kubeadm, kubectl, ubectl
+  hosts: all
+  tasks:
+    - name: Instalação dos requisitos
+      apt:
+        pkg:
+        - apt-transport-https
+        - ca-certificates
+        - curl
+        state: present
+
+    - name: Adiciona chave do repositório
+      apt_key:
+        url: https://dl.k8s.io/apt/doc/apt-key.gpg
+        state: present
+          #get_url:
+          #  url: https://dl.k8s.io/apt/doc/apt-key.gpg
+          #  dest: /etc/apt/trusted.gpg.d/kube.asc
+          #  mode: 0644
+          #  force: true
+
+    - name: Adiciona o repositório
+      apt_repository:
+        repo: deb https://apt.kubernetes.io/ kubernetes-xenial main
+        state: present
+
+    - name: Instala kubelet, kubeadm e kubectl
+      apt:
+        pkg:
+        - kubelet=1.27.1-00
+        - kubeadm=1.27.1-00
+        - kubectl=1.27.1-00
+        state: present
+
+    - name: Configura ip do node para o kubelet
+      shell: echo KUBELET_EXTRA_ARGS=--node-ip={{ ansible_ssh_host }} >> /etc/default/kubelet
+
+
+# criação do cluster
+- name: Inicializa kubeadm
+  hosts: control_plane
+  tasks:
+  - name: Limpando instalação existente
+    command: kubeadm reset -f
+
+  - name: Comando de Inicialização
+    shell: kubeadm init --apiserver-advertise-address={{ ansible_ssh_host }} --apiserver-cert-extra-sans={{ ansible_ssh_host }} --pod-network-cidr=172.16.1.0/16 --service-cidr=172.17.1.0/18 --node-name $(hostname -s) --ignore-preflight-errors Swap
+
+    
+  - name: Criação do diretório .kube
+    file:
+      path: ~/.kube
+      state: directory
+      owner: root
+      group: root
+      mode: 0644
+
+  - name: Copia arquivo kube config
+    copy:
+      dest: ~/.kube/config
+      src: /etc/kubernetes/admin.conf
+      remote_src: yes
+      owner: root
+      group: root
+      mode: 0644
+
+  - name: Instala calico
+    command: kubectl apply -f https://docs.projectcalico.org/manifests/calico.yaml
+
+  - name: Cria comando de join dos worker-nodes
+    shell: kubeadm token create --print-join-command
+    register: print_join_command
+
+  - name: Adicionando o comando de join no fact
+    set_fact: join_command="{{ print_join_command.stdout }}"
+
+- name: Realiza join de worker nodes no cluster
+  hosts: worker_node
+  tasks:
+    - name: Limpando instalação existente
+      command: kubeadm reset -f
+
+    - name: Executando o comando de join
+      command: "{{ hostvars[groups['control_plane'][0]]['join_command'] }}"
+
+
+- name: Define roles workers
+  hosts: control_plane
+  tasks:
+  - name: Definindo role do wroker node
+    shell: kubectl label node worker-node01 node-role.kubernetes.io/worker=worker && kubectl label node worker-node01 node-role.kubernetes.io/worker=worker
