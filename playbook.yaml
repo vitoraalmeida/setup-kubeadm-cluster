@@ -167,4 +167,4 @@
   hosts: control_plane
   tasks:
   - name: Definindo role do wroker node
-    shell: kubectl label node worker-node01 node-role.kubernetes.io/worker=worker && kubectl label node worker-node01 node-role.kubernetes.io/worker=worker
+    shell: kubectl label node worker-node01 node-role.kubernetes.io/worker=worker && kubectl label node worker-node02 node-role.kubernetes.io/worker=worker
